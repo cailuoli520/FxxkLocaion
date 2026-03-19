@@ -123,18 +123,25 @@ internal fun ModuleMain.installActiveGnssFromServer() {
         log("[SYS-GNSS] IGnssStatusListener not found, skipping active injection")
         return
     }
+    val cl = sysClassLoader
+    if (cl == null) {
+        log("[SYS-GNSS] sysClassLoader is null, skipping active injection")
+        return
+    }
 
     val candidates = listOf(
         "com.android.server.location.gnss.GnssManagerService",
         "com.android.server.location.gnss.GnssStatusProvider",
+        "com.android.server.location.gnss.GnssStatusListenerHelper",
+        "com.android.server.location.gnss.GnssListenerMultiplexer",
         "com.android.server.LocationManagerService"
     )
 
     var hooked = false
     for (clsName in candidates) {
-        val cls = try { Class.forName(clsName) } catch (_: Throwable) { continue }
+        val cls = try { cl.loadClass(clsName) } catch (_: Throwable) { continue }
+        // Hook any method that takes IGnssStatusListener
         for (m in cls.declaredMethods) {
-            if (!m.name.lowercase().let { it.contains("register") && it.contains("gnss") }) continue
             val hasListener = m.parameterTypes.any { listenerCls.isAssignableFrom(it) }
             if (!hasListener) continue
             try {
@@ -151,16 +158,16 @@ internal fun ModuleMain.installActiveGnssFromServer() {
                     }
                 })
                 hooked = true
-                log("[SYS-GNSS] hooked ${clsName}.${m.name}")
+                log("[SYS-GNSS] hooked ${clsName}.${m.name} (takes IGnssStatusListener)")
             } catch (e: Throwable) {
                 log("[SYS-GNSS] hook ${m.name} failed: $e")
             }
         }
-        // Hook unregister methods to clean up dead listeners
+        // Hook unregister/remove methods to clean up dead listeners
         for (m in cls.declaredMethods) {
-            if (!m.name.lowercase().let { it.contains("unregister") && it.contains("gnss") }) continue
             val hasListener = m.parameterTypes.any { listenerCls.isAssignableFrom(it) }
-            if (!hasListener) continue
+            val nameLC = m.name.lowercase()
+            if (!hasListener || !(nameLC.contains("unregister") || nameLC.contains("remove"))) continue
             try {
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
@@ -209,7 +216,7 @@ internal fun ModuleMain.ensureSysGnssFeederRunning() {
                 Thread.sleep(1000)
                 if (sysGnssListeners.isEmpty() || ourMlBinder?.mocking != true) continue
 
-                val args = buildFakeGnssArgs(onSvChanged.parameterTypes)
+                val args = buildFakeGnssArgs(onSvChanged.parameterTypes) ?: continue
                 for (l in ArrayList(sysGnssListeners)) {
                     try {
                         onSvChanged.invoke(l, *args)
@@ -237,7 +244,13 @@ internal fun ModuleMain.ensureSysGnssFeederRunning() {
 /**
  * Build fake GNSS parameter array matching the discovered onSvStatusChanged signature.
  */
-internal fun buildFakeGnssArgs(paramTypes: Array<Class<*>>): Array<Any> {
+internal fun buildFakeGnssArgs(paramTypes: Array<Class<*>>): Array<Any>? {
+    // Android 16+: onSvStatusChanged(GnssStatus)
+    if (paramTypes.size == 1 && paramTypes[0].name == "android.location.GnssStatus") {
+        val status = buildFakeGnssStatus() ?: return null
+        return arrayOf(status)
+    }
+    // Legacy: raw arrays
     val svCount = 12
     val svidWithFlags = IntArray(svCount)
     val cn0s = FloatArray(svCount)
@@ -281,6 +294,11 @@ internal fun ModuleMain.installActiveNmeaFromServer() {
         log("[SYS-NMEA] IGnssNmeaListener not found, skipping")
         return
     }
+    val cl = sysClassLoader
+    if (cl == null) {
+        log("[SYS-NMEA] sysClassLoader is null, skipping")
+        return
+    }
 
     val candidates = listOf(
         "com.android.server.location.gnss.GnssManagerService",
@@ -290,10 +308,12 @@ internal fun ModuleMain.installActiveNmeaFromServer() {
 
     var hooked = false
     for (clsName in candidates) {
-        val cls = try { Class.forName(clsName) } catch (_: Throwable) { continue }
+        val cls = try { cl.loadClass(clsName) } catch (_: Throwable) { continue }
+        // Hook any method that takes IGnssNmeaListener
         for (m in cls.declaredMethods) {
-            if (!m.name.lowercase().let { it.contains("register") && it.contains("nmea") }) continue
             if (!m.parameterTypes.any { listenerCls.isAssignableFrom(it) }) continue
+            val nameLC = m.name.lowercase()
+            if (nameLC.contains("unregister") || nameLC.contains("remove")) continue
             try {
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
@@ -313,9 +333,10 @@ internal fun ModuleMain.installActiveNmeaFromServer() {
                 log("[SYS-NMEA] hook ${m.name} failed: $e")
             }
         }
-        // Unregister hooks
+        // NMEA Unregister hooks
         for (m in cls.declaredMethods) {
-            if (!m.name.lowercase().let { it.contains("unregister") && it.contains("nmea") }) continue
+            val nameLC = m.name.lowercase()
+            if (!(nameLC.contains("unregister") || nameLC.contains("remove"))) continue
             if (!m.parameterTypes.any { listenerCls.isAssignableFrom(it) }) continue
             try {
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {

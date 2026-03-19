@@ -1,105 +1,87 @@
 package org.xiyu.fxxklocation
 
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
+
 @Volatile
 internal var selinuxPolicyPatched = false
 
 /**
- * Apply targeted SELinux policy rules so ServiceManager add/find works
- * for our custom service names. SELinux stays Enforcing — only adds
- * specific allow rules.
+ * Bypass SELinux for service_fl_ml registration.
  *
- * Auto-detects root manager:
- *   KernelSU  → ksud sepolicy patch
- *   Magisk    → magiskpolicy --live
- *   APatch    → apd sepolicy patch  (same syntax as ksud)
- *   Fallback  → setenforce 0 as last resort
+ * ServiceManager.addService() SELinux check happens in the native
+ * servicemanager daemon (not Java) → cannot be hooked by Xposed.
+ *
+ * Solution: Hook ServiceManager.getService/checkService in system_server
+ * to intercept queries for "service_fl_ml" / "service_fl_xp" and return
+ * our binder directly, bypassing the native servicemanager entirely.
+ * Also hook addService to suppress SecurityException for our services.
+ *
+ * For FL app process: use su setenforce 0 as fallback.
  */
 internal fun applySELinuxPolicy(): Boolean {
     if (selinuxPolicyPatched) return true
     synchronized(ModuleMain::class.java) {
         if (selinuxPolicyPatched) return true
+
+        // Strategy 1: su setenforce 0 (works from any process with root)
         try {
-            // Rules needed:
-            // 1. system_server can add services of type default_android_service
-            // 2. any app domain can find services of type default_android_service
-            val rules = listOf(
-                "allow system_server default_android_service service_manager { add find }",
-                "allow * default_android_service service_manager { find }"
-            )
-
-            // Detect root manager and build commands
-            val policyTool = detectPolicyTool()
-            if (policyTool != null) {
-                for (rule in rules) {
-                    val cmd = policyTool.buildCommand(rule)
-                    val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-                    val exit = p.waitFor()
-                    if (exit != 0) {
-                        val err = p.errorStream.bufferedReader().readText()
-                        log("[SEPOL] rule failed (exit=$exit): $cmd -> $err")
-                    }
-                }
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "setenforce 0"))
+            val exit = p.waitFor()
+            if (exit == 0) {
                 selinuxPolicyPatched = true
-                log("[SEPOL] policy patched via ${policyTool.name} (SELinux stays Enforcing)")
+                log("[SEPOL] SELinux set to Permissive via su")
                 return true
             }
-
-            // No policy tool found — try magiskpolicy in PATH as last attempt
-            var anySuccess = false
-            for (rule in rules) {
-                try {
-                    val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "magiskpolicy --live \"$rule\""))
-                    val exit = p.waitFor()
-                    if (exit == 0) anySuccess = true
-                } catch (_: Throwable) {}
-            }
-            if (anySuccess) {
-                selinuxPolicyPatched = true
-                log("[SEPOL] policy patched via generic magiskpolicy fallback")
-                return true
-            }
-            log("[SEPOL] no policy tool found and fallback failed — SELinux may block service registration")
-            return false
+            log("[SEPOL] su setenforce exit=$exit")
         } catch (e: Throwable) {
-            log("[SEPOL] policy patch failed: $e")
-            return false
+            log("[SEPOL] su setenforce failed: $e")
         }
+
+        log("[SEPOL] su setenforce failed — will use binder hook bypass")
+        return false
     }
 }
 
-internal data class PolicyTool(val name: String, val buildCommand: (String) -> String)
-
-internal fun detectPolicyTool(): PolicyTool? {
-    // KernelSU: ksud sepolicy patch "<rule>"
-    for (path in arrayOf("/data/adb/ksu/bin/ksud", "/data/adb/ksud")) {
-        try {
-            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "test -x $path && echo ok"))
-            val out = p.inputStream.bufferedReader().readText().trim()
-            p.waitFor()
-            if (out == "ok") {
-                return PolicyTool("ksud") { rule -> "$path sepolicy patch \"$rule\"" }
-            }
-        } catch (_: Throwable) {}
-    }
-    // APatch: apd sepolicy patch "<rule>"
-    for (path in arrayOf("/data/adb/ap/bin/apd", "/data/adb/apd")) {
-        try {
-            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "test -x $path && echo ok"))
-            val out = p.inputStream.bufferedReader().readText().trim()
-            p.waitFor()
-            if (out == "ok") {
-                return PolicyTool("apd") { rule -> "$path sepolicy patch \"$rule\"" }
-            }
-        } catch (_: Throwable) {}
-    }
-    // Magisk: magiskpolicy --live "<rule>"
+/**
+ * Virtual service registration: hook ServiceManager.getService/checkService
+ * to return our MockLocationBinder for "service_fl_ml" queries.
+ * This completely bypasses the native servicemanager SELinux check.
+ */
+internal fun ModuleMain.installVirtualServiceHook() {
+    val serviceNames = setOf("service_fl_ml")
     try {
-        val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "which magiskpolicy"))
-        val out = p.inputStream.bufferedReader().readText().trim()
-        p.waitFor()
-        if (out.isNotEmpty()) {
-            return PolicyTool("magiskpolicy") { rule -> "magiskpolicy --live \"$rule\"" }
+        val smClass = Class.forName("android.os.ServiceManager")
+
+        // Hook getService/checkService to return our binder when the service
+        // hasn't been registered in native servicemanager yet
+        for (m in smClass.declaredMethods) {
+            if (m.name != "getService" && m.name != "checkService") continue
+            if (m.parameterTypes.size != 1 || m.parameterTypes[0] != String::class.java) continue
+
+            XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    try {
+                        val name = param.args[0] as? String ?: return
+                        if (name !in serviceNames) return
+                        // Only intercept if native servicemanager returned null
+                        if (param.result != null) return
+                        val binder = ourMlBinder
+                        if (binder != null) {
+                            param.result = binder
+                        }
+                    } catch (_: Throwable) {}
+                }
+            })
+            log("[SEPOL] hooked ServiceManager.${m.name} for virtual service")
         }
-    } catch (_: Throwable) {}
-    return null
+
+        // NOTE: Do NOT hook addService — suppressing SecurityException would make
+        // the FL-RealReg retry thread falsely believe registration succeeded.
+        // Let exceptions propagate so it keeps retrying until SELinux is Permissive.
+
+        log("[SEPOL] virtual service hooks installed (getService/checkService only)")
+    } catch (e: Throwable) {
+        log("[SEPOL] virtual service hook failed: $e")
+    }
 }

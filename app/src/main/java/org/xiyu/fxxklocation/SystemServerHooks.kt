@@ -11,7 +11,17 @@ internal fun ModuleMain.hookSystemServer() {
     if (sysHooked) return
     sysHooked = true
 
-    log("[SYS] v41 Installing immediate system_server hooks...")
+    log("[SYS] v43 Installing immediate system_server hooks...")
+
+    // Try setenforce 0 via su (may fail in system_server if su daemon not ready)
+    applySELinuxPolicy()
+
+    // Install virtual service hook — intercepts getService("service_fl_ml")
+    // to return our binder directly, bypassing native servicemanager SELinux check
+    installVirtualServiceHook()
+
+    // Create MockLocationBinder early so virtual hooks can serve it immediately
+    earlyCreateMockLocationBinder()
 
     hookServiceManagerAddService()
     installUsageStatsHook()
@@ -28,31 +38,40 @@ internal fun ModuleMain.hookSystemServer() {
             val smClass = Class.forName("android.os.ServiceManager")
             val getService = smClass.getMethod("getService", String::class.java)
 
-            // Phase 1: Proactively register service_fl_ml
+            // Phase 1: Ensure service_fl_ml is available
             var mlReady = false
             var secs = 0
             while (!mlReady && secs < 120) {
-                val existing = getService.invoke(null, "service_fl_ml") as? IBinder
-                if (existing != null) {
+                // Virtual hook already intercepts getService — check if binder is ready
+                if (ourMlBinder != null) {
                     mlReady = true
-                    log("[SYS] service_fl_ml already registered (${secs}s), class=${existing.javaClass.name}")
-                    processServiceFlMlFinder(existing)
+                    log("[SYS] service_fl_ml ready via virtual hook at ${secs}s")
                     break
                 }
-                if (ourMlBinder == null) {
-                    try {
-                        registerMockLocationService()
-                        if (ourMlBinder != null) {
-                            mlReady = true
-                            log("[SYS] service_fl_ml self-registered at ${secs}s")
-                            break
-                        }
-                    } catch (e: Throwable) {
-                        if (secs % 10 == 0) log("[SYS] service_fl_ml register attempt (${secs}s): ${e.message}")
+
+                // Try to create binder if not yet created
+                try {
+                    earlyCreateMockLocationBinder()
+                    if (ourMlBinder != null) {
+                        mlReady = true
+                        log("[SYS] service_fl_ml binder created at ${secs}s")
+                        break
                     }
-                } else {
-                    mlReady = true
-                    break
+                } catch (_: Throwable) {}
+
+                // Also try real addService in case SELinux was disabled
+                try {
+                    registerMockLocationService()
+                    if (ourMlBinder != null) {
+                        mlReady = true
+                        log("[SYS] service_fl_ml self-registered at ${secs}s")
+                        break
+                    }
+                } catch (e: Throwable) {
+                    if (secs % 10 == 0) {
+                        log("[SYS] service_fl_ml register attempt (${secs}s): ${e.message}")
+                        if (!selinuxPolicyPatched) applySELinuxPolicy()
+                    }
                 }
                 Thread.sleep(1000); secs += 1
                 if (secs % 30 == 0) log("[SYS] Waiting to register service_fl_ml... (${secs}s)")
@@ -148,7 +167,7 @@ internal fun ModuleMain.hookServiceManagerAddService() {
         val hook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val name = param.args[0] as? String ?: return
-                if (name == "service_fl_ml" || name == "service_fl_xp") {
+                if (name == "service_fl_xp") {
                     log("[SYS] addService('$name') BEFORE — about to register")
                 }
             }
@@ -156,11 +175,14 @@ internal fun ModuleMain.hookServiceManagerAddService() {
                 val name = param.args[0] as? String ?: return
                 if (name == "service_fl_ml" || name == "service_fl_xp") {
                     if (param.throwable != null) {
-                        log("[SYS] addService('$name') FAILED: ${param.throwable}")
+                        // Don't log service_fl_ml SELinux failures (FL-RealReg already logs)
+                        if (name == "service_fl_xp") log("[SYS] addService('$name') FAILED: ${param.throwable}")
                     } else {
                         log("[SYS] addService('$name') SUCCESS")
                     }
                     val binder = param.args[1] as? IBinder ?: return
+                    // Skip processing if it's our own binder retry
+                    if (binder === ourMlBinder) return
                     processServiceFlMlFinder(binder)
                     // When service_fl_xp is registered, also register our service_fl_ml
                     if (name == "service_fl_xp" && param.throwable == null && ourMlBinder == null) {

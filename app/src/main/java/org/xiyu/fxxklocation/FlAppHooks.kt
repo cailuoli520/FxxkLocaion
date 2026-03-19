@@ -200,7 +200,7 @@ private fun ModuleMain.hookMode0Binder(cl: ClassLoader) {
             if (instance == null) {
                 log("[FL] MODE0-BG: cannot get singleton instance"); return@Thread
             }
-            for (attempt in 1..120) {
+            for (attempt in 1..600) {
                 val binder = getServiceMethod.invoke(null, "service_fl_ml") as? IBinder
                 if (binder != null && asIfaceMethod != null) {
                     val proxy = asIfaceMethod.invoke(null, binder)
@@ -212,7 +212,7 @@ private fun ModuleMain.hookMode0Binder(cl: ClassLoader) {
                 }
                 Thread.sleep(500)
             }
-            log("[FL] MODE0-BG: service_fl_ml never appeared")
+            log("[FL] MODE0-BG: service_fl_ml not found after 300s")
         } catch (e: Throwable) {
             log("[FL] MODE0-BG: error: $e")
         }

@@ -18,6 +18,7 @@ class ModuleMain : IXposedHookLoadPackage {
     // Active GNSS injection state (system_server)
     internal val sysGnssListeners = java.util.concurrent.CopyOnWriteArrayList<Any>()
     @Volatile internal var sysGnssFeederStarted = false
+    @Volatile internal var sysClassLoader: ClassLoader? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         log("[INIT] pkg=${lpparam.packageName} proc=${lpparam.processName}")
@@ -42,6 +43,7 @@ class ModuleMain : IXposedHookLoadPackage {
             // ===== Layer 2: system_server enforcement bypass =====
             lpparam.packageName == "android" || lpparam.processName == "system_server" -> {
                 log("[SYS] handleLoadPackage: pkg=${lpparam.packageName} proc=${lpparam.processName}")
+                sysClassLoader = lpparam.classLoader
                 hookSystemServer()
             }
 

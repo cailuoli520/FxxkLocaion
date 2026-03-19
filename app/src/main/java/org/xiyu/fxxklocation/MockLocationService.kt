@@ -12,9 +12,15 @@ import android.os.Parcel
  * via addTestProvider + setTestProviderLocation with system UID privileges.
  */
 internal class MockLocationBinder(
-    private val lm: android.location.LocationManager,
+    private val ctx: Context,
     private val bypassRemoveProvider: ThreadLocal<Boolean>
 ) : android.os.Binder() {
+    // Lazy LocationManager — avoids NPE when created early in system_server boot
+    private val lm: android.location.LocationManager?
+        get() = try {
+            ctx.getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager
+        } catch (_: Throwable) { null }
+
     @Volatile var mocking = false
     @Volatile var currentLocation: Location? = null
     @Volatile var loopInterval: Long = 1000L
@@ -121,22 +127,32 @@ internal class MockLocationBinder(
 
     private fun doStartMock() {
         mocking = true  // Set BEFORE thread starts so enforcement loop doesn't exit immediately
+        log("[SYS-ML] doStartMock called, uid=${android.os.Process.myUid()} pid=${android.os.Process.myPid()}")
         Thread {
             val token = android.os.Binder.clearCallingIdentity()
             try {
+                val locMgr = lm
+                if (locMgr == null) {
+                    log("[SYS-ML] startMock FAILED: LocationManager is null (system not ready)")
+                    mocking = false
+                    return@Thread
+                }
                 for (p in PROVIDERS) {
                     try {
                         bypassRemoveProvider.set(true)
-                        lm.removeTestProvider(p)
-                    } catch (_: Throwable) {
+                        locMgr.removeTestProvider(p)
+                        log("[SYS-ML] removeTestProvider($p) OK")
+                    } catch (e: Throwable) {
+                        log("[SYS-ML] removeTestProvider($p): ${e.message}")
                     } finally {
                         bypassRemoveProvider.set(false)
                     }
                     try {
-                        lm.addTestProvider(p, false, false, false, false, true, true, true, 1, 1)
-                        lm.setTestProviderEnabled(p, true)
+                        locMgr.addTestProvider(p, false, false, false, false, true, true, true, 1, 1)
+                        locMgr.setTestProviderEnabled(p, true)
+                        log("[SYS-ML] addTestProvider($p) + enabled OK")
                     } catch (e: Throwable) {
-                        log("[SYS-ML] addTestProvider($p) skipped: ${e.message}")
+                        log("[SYS-ML] addTestProvider($p) FAILED: ${e.javaClass.simpleName}: ${e.message}")
                     }
                 }
                 log("[SYS-ML] startMock: test providers ready")
@@ -157,10 +173,11 @@ internal class MockLocationBinder(
         Thread {
             val token = android.os.Binder.clearCallingIdentity()
             try {
+                val locMgr = lm ?: return@Thread
                 for (p in PROVIDERS) {
                     try {
                         bypassRemoveProvider.set(true)
-                        lm.removeTestProvider(p)
+                        locMgr.removeTestProvider(p)
                     } catch (_: Throwable) {}
                     finally { bypassRemoveProvider.set(false) }
                 }
@@ -179,6 +196,7 @@ internal class MockLocationBinder(
 
     /** Push location to all test providers with fresh timestamps and realistic GPS metadata. */
     private fun pushLocation(location: Location) {
+        val locMgr = lm ?: return
         val token = android.os.Binder.clearCallingIdentity()
         try {
             val now = System.currentTimeMillis()
@@ -205,13 +223,14 @@ internal class MockLocationBinder(
                     extras.putInt("satellitesInFix", 10)
                     extras.remove("mockProvider")
                     loc.extras = extras
-                    lm.setTestProviderLocation(p, loc)
+                    locMgr.setTestProviderLocation(p, loc)
                 } catch (e: Throwable) {
+                    log("[SYS-ML] setTestProviderLocation($p) ERR: ${e.javaClass.simpleName}: ${e.message}")
                     // Auto-recover: re-add test provider if removed
                     if (e.message?.contains("not a test provider") == true) {
                         try {
-                            lm.addTestProvider(p, false, false, false, false, true, true, true, 1, 1)
-                            lm.setTestProviderEnabled(p, true)
+                            locMgr.addTestProvider(p, false, false, false, false, true, true, true, 1, 1)
+                            locMgr.setTestProviderEnabled(p, true)
                         } catch (_: Throwable) {}
                     }
                 }
@@ -260,8 +279,7 @@ internal fun ModuleMain.registerMockLocationService() {
             log("[SYS-ML] Cannot get system context for service_fl_ml")
             return
         }
-        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-        val binder = MockLocationBinder(lm, bypassRemoveProvider)
+        val binder = MockLocationBinder(ctx, bypassRemoveProvider)
         val smClass = Class.forName("android.os.ServiceManager")
 
         // Try multiple addService overloads — Android versions differ:
@@ -320,5 +338,78 @@ internal fun ModuleMain.getSystemServerContext(): Context? {
     } catch (e: Throwable) {
         log("[SYS-ML] getSystemServerContext: $e")
         null
+    }
+}
+
+/**
+ * Create MockLocationBinder early without requiring ServiceManager.addService.
+ * The virtual hook in SelinuxPolicy.kt intercepts getService("service_fl_ml")
+ * and returns this binder directly, bypassing native SELinux checks.
+ */
+internal fun ModuleMain.earlyCreateMockLocationBinder() {
+    if (ourMlBinder != null) return
+    try {
+        val ctx = getSystemServerContext() ?: return
+        val binder = MockLocationBinder(ctx, bypassRemoveProvider)
+        ourMlBinder = binder
+        log("[SYS-ML] MockLocationBinder created (virtual — no ServiceManager.addService needed)")
+
+        // Also try real registration in background — keeps retrying until SELinux is Permissive
+        // (FL app process will `su setenforce 0` when it starts)
+        Thread {
+            try {
+                val smClass = Class.forName("android.os.ServiceManager")
+                var registered = false
+                var secs = 0
+                // Retry indefinitely — FL app may not start for several minutes
+                while (!registered) {
+                    Thread.sleep(2000)
+                    secs += 2
+                    if (secs % 30 == 0) log("[SYS-ML] FL-RealReg: still retrying (${secs}s)")
+                    // Try addService — will fail with SecurityException until SELinux is Permissive
+                    try {
+                        smClass.getMethod("addService", String::class.java, android.os.IBinder::class.java,
+                            Boolean::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                            .invoke(null, "service_fl_ml", binder, false, 0)
+                        // Verify the registration actually worked via native servicemanager
+                        val check = smClass.getMethod("getService", String::class.java)
+                            .invoke(null, "service_fl_ml") as? android.os.IBinder
+                        if (check != null) {
+                            registered = true
+                            log("[SYS-ML] FL-RealReg: registered + verified at ${secs}s")
+                        } else {
+                            log("[SYS-ML] FL-RealReg: addService returned OK but getService=null at ${secs}s")
+                        }
+                    } catch (e: Throwable) {
+                        val cause = if (e is java.lang.reflect.InvocationTargetException) e.targetException else e
+                        if (cause is SecurityException) {
+                            if (secs % 30 == 0) log("[SYS-ML] FL-RealReg: SELinux blocked (${secs}s)")
+                        } else {
+                            // Try 3-arg fallback
+                            try {
+                                smClass.getMethod("addService", String::class.java, android.os.IBinder::class.java,
+                                    Boolean::class.javaPrimitiveType)
+                                    .invoke(null, "service_fl_ml", binder, false)
+                                val check = smClass.getMethod("getService", String::class.java)
+                                    .invoke(null, "service_fl_ml") as? android.os.IBinder
+                                if (check != null) {
+                                    registered = true
+                                    log("[SYS-ML] FL-RealReg: registered (3-arg) + verified at ${secs}s")
+                                } else {
+                                    log("[SYS-ML] FL-RealReg: 3-arg OK but getService=null at ${secs}s")
+                                }
+                            } catch (e2: Throwable) {
+                                val c2 = if (e2 is java.lang.reflect.InvocationTargetException) e2.targetException else e2
+                                if (secs % 10 == 0) log("[SYS-ML] FL-RealReg: ${cause.javaClass.simpleName}/${c2.javaClass.simpleName} (${secs}s)")
+                            }
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                log("[SYS-ML] FL-RealReg: thread error: $e")
+            }
+        }.apply { name = "FL-RealReg"; isDaemon = true; start() }
+    } catch (e: Throwable) {
+        log("[SYS-ML] earlyCreateMockLocationBinder failed: $e")
     }
 }
