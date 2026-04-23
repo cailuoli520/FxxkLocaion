@@ -70,7 +70,7 @@ private fun ModuleMain.hookAgreementDialog(cl: ClassLoader) {
 private fun ModuleMain.hookUpdateDialog(cl: ClassLoader) {
     // TODO: 请将 "com.lerist.common.version.C11159" 替换为实际的更新弹窗类名，如果也是某个混淆名称比如 "gc3"，请替换。
     val updateDialogClass = try {
-        XposedHelpers.findClass("com.lerist.common.version.C11159", cl)
+        XposedHelpers.findClass("com.lerist.common.version.ඈ", cl)
     } catch (e: Exception) {
         log("[FL] UpdateDialog: class not found")
         return
